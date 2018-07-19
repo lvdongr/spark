@@ -154,10 +154,15 @@ class InMemoryCatalogedDDLSuite extends DDLSuite with SharedSQLContext with Befo
       Seq(4 -> "d").toDF("i", "j").write.saveAsTable("t1")
 
       val e = intercept[AnalysisException] {
-        Seq(5 -> "e").toDF("i", "j").write.mode("append").format("json").saveAsTable("t1")
+        val format = if (spark.sessionState.conf.defaultDataSourceName.equalsIgnoreCase("json")) {
+          "orc"
+        } else {
+          "json"
+        }
+        Seq(5 -> "e").toDF("i", "j").write.mode("append").format(format).saveAsTable("t1")
       }
-      assert(e.message.contains("The format of the existing table default.t1 is " +
-        "`ParquetFileFormat`. It doesn't match the specified format `JsonFileFormat`."))
+      assert(e.message.contains("The format of the existing table default.t1 is "))
+      assert(e.message.contains("It doesn't match the specified format"))
     }
   }
 }
@@ -175,6 +180,13 @@ abstract class DDLSuite extends QueryTest with SQLTestUtils {
 
   private val escapedIdentifier = "`(.+)`".r
 
+  private def dataSource: String = {
+    if (isUsingHiveMetastore) {
+      "HIVE"
+    } else {
+      "PARQUET"
+    }
+  }
   protected def normalizeCatalogTable(table: CatalogTable): CatalogTable = table
 
   private def normalizeSerdeProp(props: Map[String, String]): Map[String, String] = {
@@ -357,6 +369,93 @@ abstract class DDLSuite extends QueryTest with SQLTestUtils {
       } finally {
         catalog.reset()
       }
+    }
+  }
+
+  test("CTAS a managed table with the existing empty directory") {
+    val tableLoc = new File(spark.sessionState.catalog.defaultTablePath(TableIdentifier("tab1")))
+    try {
+      tableLoc.mkdir()
+      withTable("tab1") {
+        sql(s"CREATE TABLE tab1 USING ${dataSource} AS SELECT 1, 'a'")
+        checkAnswer(spark.table("tab1"), Row(1, "a"))
+      }
+    } finally {
+      waitForTasksToFinish()
+      Utils.deleteRecursively(tableLoc)
+    }
+  }
+
+  test("create a managed table with the existing empty directory") {
+    val tableLoc = new File(spark.sessionState.catalog.defaultTablePath(TableIdentifier("tab1")))
+    try {
+      tableLoc.mkdir()
+      withTable("tab1") {
+        sql(s"CREATE TABLE tab1 (col1 int, col2 string) USING ${dataSource}")
+        sql("INSERT INTO tab1 VALUES (1, 'a')")
+        checkAnswer(spark.table("tab1"), Row(1, "a"))
+      }
+    } finally {
+      waitForTasksToFinish()
+      Utils.deleteRecursively(tableLoc)
+    }
+  }
+
+  test("create a managed table with the existing non-empty directory") {
+    withTable("tab1") {
+      val tableLoc = new File(spark.sessionState.catalog.defaultTablePath(TableIdentifier("tab1")))
+      try {
+        // create an empty hidden file
+        tableLoc.mkdir()
+        val hiddenGarbageFile = new File(tableLoc.getCanonicalPath, ".garbage")
+        hiddenGarbageFile.createNewFile()
+        val exMsg = "Can not create the managed table('`tab1`'). The associated location"
+        val exMsgWithDefaultDB =
+          "Can not create the managed table('`default`.`tab1`'). The associated location"
+        var ex = intercept[AnalysisException] {
+          sql(s"CREATE TABLE tab1 USING ${dataSource} AS SELECT 1, 'a'")
+        }.getMessage
+        if (isUsingHiveMetastore) {
+          assert(ex.contains(exMsgWithDefaultDB))
+        } else {
+          assert(ex.contains(exMsg))
+        }
+
+        ex = intercept[AnalysisException] {
+          sql(s"CREATE TABLE tab1 (col1 int, col2 string) USING ${dataSource}")
+        }.getMessage
+        assert(ex.contains(exMsgWithDefaultDB))
+
+        // Always check location of managed table, with or without (IF NOT EXISTS)
+        withTable("tab2") {
+          sql(s"CREATE TABLE tab2 (col1 int, col2 string) USING ${dataSource}")
+          ex = intercept[AnalysisException] {
+            sql(s"CREATE TABLE IF NOT EXISTS tab1 LIKE tab2")
+          }.getMessage
+          assert(ex.contains(exMsgWithDefaultDB))
+        }
+      } finally {
+        waitForTasksToFinish()
+        Utils.deleteRecursively(tableLoc)
+      }
+    }
+  }
+
+  test("rename a managed table with existing empty directory") {
+    val tableLoc = new File(spark.sessionState.catalog.defaultTablePath(TableIdentifier("tab2")))
+    try {
+      withTable("tab1") {
+        sql(s"CREATE TABLE tab1 USING $dataSource AS SELECT 1, 'a'")
+        tableLoc.mkdir()
+        val ex = intercept[AnalysisException] {
+          sql("ALTER TABLE tab1 RENAME TO tab2")
+        }.getMessage
+        val expectedMsg = "Can not rename the managed table('`tab1`'). The associated location"
+        assert(ex.contains(expectedMsg))
+      }
+    } finally {
+      waitForTasksToFinish()
+      Utils.deleteRecursively(tableLoc)
     }
   }
 
@@ -1661,8 +1760,8 @@ abstract class DDLSuite extends QueryTest with SQLTestUtils {
       sql("DESCRIBE FUNCTION 'concat'"),
       Row("Class: org.apache.spark.sql.catalyst.expressions.Concat") ::
         Row("Function: concat") ::
-        Row("Usage: concat(str1, str2, ..., strN) - " +
-            "Returns the concatenation of str1, str2, ..., strN.") :: Nil
+        Row("Usage: concat(col1, col2, ..., colN) - " +
+            "Returns the concatenation of col1, col2, ..., colN.") :: Nil
     )
     // extended mode
     checkAnswer(
@@ -2414,7 +2513,7 @@ abstract class DDLSuite extends QueryTest with SQLTestUtils {
 
   test("alter datasource table add columns - text format not supported") {
     withTable("t1") {
-      sql("CREATE TABLE t1 (c1 int) USING text")
+      sql("CREATE TABLE t1 (c1 string) USING text")
       val e = intercept[AnalysisException] {
         sql("ALTER TABLE t1 ADD COLUMNS (c2 int)")
       }.getMessage

@@ -17,7 +17,7 @@
 
 import sys
 
-from pyspark import since
+from pyspark import since, _NoValue
 from pyspark.rdd import ignore_unicode_prefix
 
 
@@ -39,15 +39,16 @@ class RuntimeConfig(object):
 
     @ignore_unicode_prefix
     @since(2.0)
-    def get(self, key, default=None):
+    def get(self, key, default=_NoValue):
         """Returns the value of Spark runtime configuration property for the given key,
         assuming it is set.
         """
         self._checkType(key, "key")
-        if default is None:
+        if default is _NoValue:
             return self._jconf.get(key)
         else:
-            self._checkType(default, "default")
+            if default is not None:
+                self._checkType(default, "default")
             return self._jconf.get(key, default)
 
     @ignore_unicode_prefix
@@ -62,11 +63,18 @@ class RuntimeConfig(object):
             raise TypeError("expected %s '%s' to be a string (was '%s')" %
                             (identifier, obj, type(obj).__name__))
 
+    @ignore_unicode_prefix
+    @since(2.4)
+    def isModifiable(self, key):
+        """Indicates whether the configuration property with the given key
+        is modifiable in the current session.
+        """
+        return self._jconf.isModifiable(key)
+
 
 def _test():
     import os
     import doctest
-    from pyspark.context import SparkContext
     from pyspark.sql.session import SparkSession
     import pyspark.sql.conf
 
